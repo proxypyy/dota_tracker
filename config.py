@@ -1,14 +1,4 @@
-"""Цели мониторинга и настройки трекера обновлений сборок Dota 2.
-
-Источник версий — публичный интерфейс Steam Web API IGCVersion_* (его же
-использует клиент Steam). Ответ имеет вид:
-    {"result": {"success": true, ..., "active_version": 6973, ...}}
-
-Нюанс: у серверных appid (373310, 2305290, 247060) нет собственного интерфейса
-IGCVersion_<appid> — Steam отвечает "Interface not found". Их версии отдаёт
-метод GetServerVersion родительского приложения, поэтому в URL два
-идентификатора: gc_appid (владелец интерфейса) и appid (отслеживаемая цель).
-"""
+"""Цели мониторинга и настройки трекера обновлений сборок Dota 2."""
 
 # {gc_appid} — приложение-владелец Game Coordinator,
 # {method}   — GetClientVersion (клиент) или GetServerVersion (dedicated server),
@@ -36,15 +26,22 @@ MAIN_APP_IDS = frozenset({570, 373310})
 # Сеть: Steam API.
 STEAM_TIMEOUT_SECONDS = 10
 STEAM_MAX_ATTEMPTS = 3
-RETRY_BACKOFF_SECONDS = 2.0            # backoff: 2 с, 4 с (и для Discord)
-STEAM_RETRY_SLEEP_CAP_SECONDS = 30.0   # потолок ожидания по Retry-After
-STEAM_POLITE_DELAY_SECONDS = 0.5       # вежливая пауза между опросами целей
+RETRY_BACKOFF_SECONDS = 2.0            # backoff: 2 с, 4 с (общий)
+STEAM_RETRY_SLEEP_CAP_SECONDS = 30.0
+STEAM_POLITE_DELAY_SECONDS = 0.5
 
 # Сеть: Discord webhook.
 DISCORD_TIMEOUT_SECONDS = 30
 DISCORD_MAX_ATTEMPTS = 3
-DISCORD_SEND_DELAY_SECONDS = 1.5       # пауза между отправками (rate-limit)
+DISCORD_SEND_DELAY_SECONDS = 1.5
 DISCORD_RETRY_SLEEP_CAP_SECONDS = 60.0
+
+# Сеть: Telegram Bot API.
+TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
+TELEGRAM_TIMEOUT_SECONDS = 30
+TELEGRAM_MAX_ATTEMPTS = 3
+TELEGRAM_SEND_DELAY_SECONDS = 1.5      # пауза между постами в канал
+TELEGRAM_RETRY_SLEEP_CAP_SECONDS = 60.0
 
 # Прочее.
 MSK_UTC_OFFSET_HOURS = 3

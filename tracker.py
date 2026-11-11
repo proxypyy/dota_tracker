@@ -3,13 +3,14 @@
 Один проход:
     1. Опрос Steam Web API (IGCVersion_*) для каждой цели из config.TRACKED_APPS.
     2. Сравнение result.active_version с сохранённым в steam_api/versions/.
-    3. Первый запуск: только baseline-файлы, без истории и Discord.
+    3. Первый запуск: только baseline-файлы, без истории и уведомлений.
     4. Обновление: перезапись JSON + запись в _HISTORY_by_date.txt / _HISTORY_by_name.txt.
-    5. При любых изменениях: git add -> commit -> push, затем Discord-уведомления
-       (multipart/form-data: payload_json + файл версии), пауза 1.5 с между отправками.
+    5. При любых изменениях: git add -> commit -> push, затем уведомления:
+       Discord (embed + файл) и/или Telegram (документ + HTML-подпись).
+       Оба канала опциональны и независимы; пауза 1.5 с между отправками.
 
-DRY_RUN=true выполняет шаги 1-4 локально, пропуская git и Discord.
-Коды выхода: 0 — успех / нет изменений; 1 — ошибка git или Discord.
+DRY_RUN=true выполняет шаги 1-4 локально, пропуская git и уведомления.
+Коды выхода: 0 — успех / нет изменений; 1 — ошибка git или уведомлений.
 """
 
 import json
@@ -41,7 +42,7 @@ def msk_timestamp() -> str:
 
 
 def log(message: str) -> None:
-    """Лог с московским временем; flush=True — чтобы логи Actions шли по порядку."""
+    """Лог с московским временем; flush=True — для логов GitHub Actions."""
     print(f"[{msk_timestamp()}] {message}", flush=True)
 
 
@@ -69,10 +70,7 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def retry_after_seconds(response: requests.Response, default: float, cap: float) -> float:
-    """Извлекает Retry-After (в секундах), ограничивая ожидание сверху.
-
-    Значение в формате HTTP-date не поддерживаем — используем обычный backoff.
-    """
+    """Извлекает Retry-After (в секундах), ограничивая ожидание сверху."""
     raw = response.headers.get("Retry-After", "").strip()
     if raw:
         try:
@@ -83,11 +81,7 @@ def retry_after_seconds(response: requests.Response, default: float, cap: float)
 
 
 def fetch_steam_payload(session: requests.Session, appid: int, app_cfg: dict) -> dict | None:
-    """GET к Steam API: 3 попытки, таймаут 10 с, backoff на 429/5xx и сетевых ошибках.
-
-    Возвращает полный ответ вида {"result": {...}} либо None (цель пропускается,
-    остальные цели продолжают опрашиваться).
-    """
+    """GET к Steam API: 3 попытки, таймаут 10 с, backoff на 429/5xx и сетевых ошибках."""
     url = config.STEAM_API_URL_TEMPLATE.format(
         gc_appid=app_cfg["gc_appid"], method=app_cfg["method"], appid=appid
     )
@@ -141,7 +135,7 @@ def fetch_steam_payload(session: requests.Session, appid: int, app_cfg: dict) ->
 
 
 def read_saved_payload(path: Path) -> dict | None:
-    """Читает сохранённый JSON; битый/нечитаемый файл трактуем как отсутствие baseline."""
+    """Читает сохранённый JSON; битый файл трактуем как отсутствие baseline."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -171,10 +165,7 @@ def append_history_by_date(line: str) -> None:
 
 
 def insert_history_by_name(line: str, prefix: str) -> None:
-    """Вставляет строку сразу после последней строки, начинающейся с prefix.
-
-    Если таких строк ещё нет — добавляет в конец файла.
-    """
+    """Вставляет строку после последней строки с prefix; иначе — в конец."""
     lines = HISTORY_BY_NAME_FILE.read_text(encoding="utf-8").splitlines()
     insert_at = len(lines)
     for index in range(len(lines) - 1, -1, -1):
@@ -186,7 +177,7 @@ def insert_history_by_name(line: str, prefix: str) -> None:
 
 
 def run_git(*args: str) -> str:
-    """subprocess.run(..., check=True); GIT_TERMINAL_PROMPT=0 — не зависать на запросе логина."""
+    """subprocess.run(..., check=True); GIT_TERMINAL_PROMPT=0 — не зависать на логине."""
     completed = subprocess.run(
         ["git", *args],
         cwd=BASE_DIR,
@@ -208,6 +199,7 @@ def git_commit_and_push(changed_files: int) -> str:
 
 
 def build_embed(update: dict, commit_url: str) -> dict:
+    """Embed для Discord (формат боевого уведомления)."""
     appid = update["appid"]
     color = config.EMBED_COLOR_MAIN if appid in config.MAIN_APP_IDS else config.EMBED_COLOR_TEST
     description = (
@@ -225,10 +217,7 @@ def build_embed(update: dict, commit_url: str) -> dict:
 def send_discord_update(
     session: requests.Session, webhook_url: str, update: dict, commit_url: str
 ) -> bool:
-    """POST multipart/form-data: поле payload_json (embed) + поле file (JSON версии).
-
-    3 попытки; при 429 учитывается retry_after из тела ответа Discord.
-    """
+    """POST multipart/form-data: payload_json (embed) + file (JSON версии)."""
     appid = update["appid"]
     json_path = version_file_path(appid, update["name"])
     payload_json = json.dumps(
@@ -238,8 +227,6 @@ def send_discord_update(
     attempts = config.DISCORD_MAX_ATTEMPTS
 
     for attempt in range(1, attempts + 1):
-        # payload_json передаём частью files с filename=None — это form-поле без файла;
-        # явные UTF-8 байты исключают любые проблемы с кодировкой multipart.
         files = {
             "payload_json": (None, payload_json, "application/json"),
             "file": (json_path.name, file_bytes, "application/json"),
@@ -281,12 +268,102 @@ def send_discord_update(
     return False
 
 
-def collect_updates(session: requests.Session) -> tuple[list[dict], int]:
-    """Опрашивает все цели, пишет файлы версий и историю.
+def tg_escape(value) -> str:
+    """Минимальный HTML-escape для parse_mode=HTML (без сторонних модулей)."""
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    Возвращает (список обновлений для Discord, число изменённых файлов).
-    Счётчик файлов: baseline = 1 (JSON), обновление = 3 (JSON + два файла истории) —
-    поэтому коммит одного обновления называется "steam_api | 3 files".
+
+def build_telegram_caption(update: dict, commit_url: str) -> str:
+    """HTML-подпись к документу в Telegram (аналог embed в Discord)."""
+    return (
+        f"<b>Обновление: {tg_escape(update['name'])} ({update['appid']})</b>\n"
+        f"Версия: <b>{tg_escape(update['old_version'])}</b> ➔ "
+        f"<b>{tg_escape(update['new_version'])}</b>\n"
+        f"Время: <code>{tg_escape(update['timestamp'])} (UTC+3)</code>\n"
+        f'<a href="{tg_escape(commit_url)}">Открыть diff на GitHub</a>'
+    )
+
+
+def send_telegram_update(
+    session: requests.Session, bot_token: str, chat_id: str, update: dict, commit_url: str
+) -> bool:
+    """sendDocument: JSON-файл версии + HTML-подпись. 3 попытки, учёт retry_after."""
+    appid = update["appid"]
+    json_path = version_file_path(appid, update["name"])
+    file_bytes = json_path.read_bytes()
+    caption = build_telegram_caption(update, commit_url)
+    url = config.TELEGRAM_API_URL_TEMPLATE.format(token=bot_token, method="sendDocument")
+    attempts = config.TELEGRAM_MAX_ATTEMPTS
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                files={"document": (json_path.name, file_bytes, "application/json")},
+                timeout=config.TELEGRAM_TIMEOUT_SECONDS,
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            log(f"[{appid}] Telegram: сетевая ошибка {type(exc).__name__} (попытка {attempt}/{attempts})")
+            if attempt < attempts:
+                time.sleep(config.RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        if response.status_code == 200 and body.get("ok") is True:
+            log(f"[{appid}] Telegram: уведомление отправлено")
+            return True
+
+        error_code = body.get("error_code")
+        description = body.get("description") or response.text[:200]
+
+        if response.status_code == 429 or error_code == 429:
+            delay = config.TELEGRAM_SEND_DELAY_SECONDS
+            parameters = body.get("parameters")
+            if isinstance(parameters, dict):
+                try:
+                    delay = float(parameters.get("retry_after", delay))
+                except (TypeError, ValueError):
+                    pass
+            delay = min(max(delay, 0.0) + 0.5, config.TELEGRAM_RETRY_SLEEP_CAP_SECONDS)
+            log(f"[{appid}] Telegram 429: пауза {delay:.1f} с (попытка {attempt}/{attempts})")
+            if attempt < attempts:
+                time.sleep(delay)
+            continue
+
+        if response.status_code in RETRYABLE_HTTP_STATUSES or (
+            isinstance(error_code, int) and error_code >= 500
+        ):
+            log(f"[{appid}] Telegram HTTP {response.status_code} (попытка {attempt}/{attempts})")
+            if attempt < attempts:
+                time.sleep(config.RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if response.status_code == 401:
+            log(f"[{appid}] Telegram 401: неверный TELEGRAM_BOT_TOKEN ({description})")
+        elif response.status_code == 403:
+            log(f"[{appid}] Telegram 403: бот не админ канала или нет права Post messages ({description})")
+        elif response.status_code == 400:
+            log(f"[{appid}] Telegram 400: проверьте TELEGRAM_CHAT_ID ({description})")
+        else:
+            log(f"[{appid}] Telegram HTTP {response.status_code}: {description}")
+        return False
+
+    log(f"[{appid}] Telegram: все {attempts} попытки исчерпаны")
+    return False
+
+
+def collect_updates(session: requests.Session) -> tuple[list[dict], int]:
+    """Опрашивает цели, пишет файлы и историю.
+
+    Возвращает (список обновлений, число изменённых файлов):
+    baseline = 1 файл, обновление = 3 файла (JSON + две истории).
     """
     updates: list[dict] = []
     changed_files = 0
@@ -303,14 +380,12 @@ def collect_updates(session: requests.Session) -> tuple[list[dict], int]:
         new_version = extract_active_version(payload)
         path = version_file_path(appid, name)
 
-        # Первый запуск: сохраняем baseline, историю и Discord не трогаем.
         if not path.exists():
             save_payload(path, payload)
             changed_files += 1
             log(f"[{appid}] {name}: первый запуск — baseline v{new_version} сохранён, без уведомлений")
             continue
 
-        # Файл есть, но повреждён/без версии: восстанавливаем baseline без спама.
         old_version = extract_active_version(read_saved_payload(path))
         if old_version is None:
             save_payload(path, payload)
@@ -347,10 +422,15 @@ def main() -> int:
     dry_run = is_dry_run()
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
     repo_url = os.getenv("GITHUB_REPO_URL", "").strip()
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    telegram_ready = bool(telegram_token and telegram_chat_id)
 
     log(f"Трекер запущен. DRY_RUN={'true' if dry_run else 'false'}")
-    if not dry_run and not webhook_url:
-        log("ВНИМАНИЕ: DISCORD_WEBHOOK_URL не задан — уведомления будут пропущены")
+    if not dry_run and not webhook_url and not telegram_ready:
+        log("ВНИМАНИЕ: не настроен ни Discord, ни Telegram — уведомления будут пропущены")
+    if not dry_run and bool(telegram_token) != bool(telegram_chat_id):
+        log("ВНИМАНИЕ: для Telegram нужны ОБА параметра: TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
     if not dry_run and not repo_url:
         log("ВНИМАНИЕ: GITHUB_REPO_URL не задан — ссылка на коммит будет некорректной")
 
@@ -370,7 +450,7 @@ def main() -> int:
             log("[DRY_RUN] git add/commit/push пропущены")
             for update in updates:
                 log(
-                    f"[DRY_RUN] Discord пропущен: {update['appid']} - {update['name']} "
+                    f"[DRY_RUN] уведомления пропущены: {update['appid']} - {update['name']} "
                     f"v{update['old_version']} => v{update['new_version']}"
                 )
             return 0
@@ -388,16 +468,32 @@ def main() -> int:
         if not updates:
             log("Сохранены только baseline-файлы — уведомления не требуются")
             return 0
-        if not webhook_url:
-            log("ОШИБКА: есть обновления, но DISCORD_WEBHOOK_URL не задан")
+        if not webhook_url and not telegram_ready:
+            log("ОШИБКА: есть обновления, но не настроен ни Discord, ни Telegram")
             return 1
 
         all_sent = True
-        for index, update in enumerate(updates):
-            if index > 0:
-                time.sleep(config.DISCORD_SEND_DELAY_SECONDS)
-            if not send_discord_update(session, webhook_url, update, commit_url):
-                all_sent = False
+
+        if webhook_url:
+            for index, update in enumerate(updates):
+                if index > 0:
+                    time.sleep(config.DISCORD_SEND_DELAY_SECONDS)
+                if not send_discord_update(session, webhook_url, update, commit_url):
+                    all_sent = False
+        else:
+            log("Discord не настроен — уведомления пропущены")
+
+        if telegram_ready:
+            for index, update in enumerate(updates):
+                if index > 0:
+                    time.sleep(config.TELEGRAM_SEND_DELAY_SECONDS)
+                if not send_telegram_update(
+                    session, telegram_token, telegram_chat_id, update, commit_url
+                ):
+                    all_sent = False
+        else:
+            log("Telegram не настроен — уведомления пропущены")
+
         return 0 if all_sent else 1
 
 

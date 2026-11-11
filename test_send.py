@@ -2,18 +2,19 @@
 
 Запуск:
     python test_send.py            # интерактивное меню
-    echo 5 | python test_send.py   # все проверки без вопросов (код выхода 0/1)
+    echo 8 | python test_send.py   # все проверки без вопросов (код выхода 0/1)
 
 Проверки:
     1 — Steam API: текущие версии всех целей (боевой код из tracker.py).
-    2 — Discord: текстовое сообщение в webhook (валидность вебхука).
-    3 — Discord: тестовый embed + JSON-файл — формат боевого уведомления,
-        помеченный [ТЕСТ]. Историю не трогает, git-операций не выполняет.
-    4 — Git: репозиторий, user.name/email, remote, право на push
-        (git push --dry-run — реально ничего не отправляется).
-    5 — все проверки подряд + сводка.
+    2 — Discord: текстовое сообщение в webhook.
+    3 — Discord: тестовый embed + JSON-файл (формат уведомления, [ТЕСТ]).
+    4 — Telegram: текстовое сообщение в канал.
+    5 — Telegram: документ + HTML-подпись (формат уведомления, [ТЕСТ]).
+    6 — Telegram: определить chat_id канала через getUpdates.
+    7 — Git: репозиторий, user.name/email, remote, право на push (push --dry-run).
+    8 — все проверки подряд + сводка (ненастроенные каналы — SKIP).
 
-Побочные эффекты: отсутствуют, кроме того, что проверка 3 может создать
+Побочные эффекты: отсутствуют, кроме того, что проверки 3/5 могут создать
 baseline-файл цели, если его ещё нет (точно как первый запуск трекера).
 DRY_RUN на этот скрипт не влияет: его задача — реально отправлять тесты.
 """
@@ -35,7 +36,7 @@ SEP = "-" * 62
 
 
 def ask(prompt: str, default: str = "") -> str:
-    """input() с обработкой EOF: позволяет запускать `echo 5 | python test_send.py`."""
+    """input() с обработкой EOF: позволяет запускать `echo 8 | python test_send.py`."""
     try:
         value = input(prompt).strip()
     except EOFError:
@@ -52,6 +53,14 @@ def repo_url() -> str:
     return os.getenv("GITHUB_REPO_URL", "").strip()
 
 
+def telegram_token() -> str:
+    return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+
+def telegram_chat_id() -> str:
+    return os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
 def require_webhook() -> str | None:
     url = webhook_url()
     if not url:
@@ -61,6 +70,17 @@ def require_webhook() -> str | None:
     if "/api/webhooks/" not in url:
         print("WARNING: URL не похож на Discord webhook, пробую всё равно...")
     return url
+
+
+def require_telegram() -> tuple[str, str] | None:
+    token = telegram_token()
+    chat_id = telegram_chat_id()
+    if not token or not chat_id:
+        print("FAIL: Telegram не настроен: нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID (.env).")
+        print("      Бот: @BotFather -> /newbot. Канал: добавьте бота админом (право Post messages).")
+        print("      chat_id: публичный канал — @username; приватный — пункт 6 этого скрипта.")
+        return None
+    return token, chat_id
 
 
 def explain_discord_error(response: requests.Response) -> None:
@@ -74,7 +94,7 @@ def explain_discord_error(response: requests.Response) -> None:
 
 
 def post_with_retry(send) -> bool:
-    """Вызывает send() -> Response; 3 попытки, обработка 429/5xx/таймаутов."""
+    """Вызывает send() -> Response; 3 попытки, обработка 429/5xx/таймаутов (Discord)."""
     attempts = config.DISCORD_MAX_ATTEMPTS
     for attempt in range(1, attempts + 1):
         try:
@@ -113,6 +133,67 @@ def post_with_retry(send) -> bool:
     return False
 
 
+def tg_post_with_retry(send) -> bool:
+    """Вызывает send() -> Response; 3 попытки, обработка 429/5xx/таймаутов (Telegram)."""
+    attempts = config.TELEGRAM_MAX_ATTEMPTS
+    for attempt in range(1, attempts + 1):
+        try:
+            response = send()
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            print(f"Сетевая ошибка {type(exc).__name__} (попытка {attempt}/{attempts})")
+            if attempt < attempts:
+                time.sleep(config.RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        if response.status_code == 200 and body.get("ok") is True:
+            return True
+
+        error_code = body.get("error_code")
+        description = body.get("description") or response.text[:200]
+
+        if response.status_code == 429 or error_code == 429:
+            delay = config.TELEGRAM_SEND_DELAY_SECONDS
+            parameters = body.get("parameters")
+            if isinstance(parameters, dict):
+                try:
+                    delay = float(parameters.get("retry_after", delay))
+                except (TypeError, ValueError):
+                    pass
+            delay = min(max(delay, 0.0) + 0.5, config.TELEGRAM_RETRY_SLEEP_CAP_SECONDS)
+            print(f"HTTP 429: пауза {delay:.1f} с (попытка {attempt}/{attempts})")
+            if attempt < attempts:
+                time.sleep(delay)
+            continue
+
+        if response.status_code in tracker.RETRYABLE_HTTP_STATUSES or (
+            isinstance(error_code, int) and error_code >= 500
+        ):
+            print(f"HTTP {response.status_code} (попытка {attempt}/{attempts})")
+            if attempt < attempts:
+                time.sleep(config.RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if response.status_code == 401:
+            print("FAIL: 401 — неверный TELEGRAM_BOT_TOKEN (BotFather -> /token).")
+        elif response.status_code == 403:
+            print(f"FAIL: 403 — бот не админ канала или нет права Post messages ({description}).")
+        elif response.status_code == 400:
+            print(f"FAIL: 400 — {description}. Проверьте TELEGRAM_CHAT_ID.")
+        else:
+            print(f"FAIL: HTTP {response.status_code}: {description}")
+        return False
+
+    print(f"FAIL: все {attempts} попытки исчерпаны.")
+    return False
+
+
 def git_run(*args: str) -> tuple[bool, str]:
     """git с таймаутом 30 с; возвращает (успех, stdout+stderr)."""
     try:
@@ -133,6 +214,67 @@ def git_run(*args: str) -> tuple[bool, str]:
     except OSError as exc:
         return False, f"git не найден: {exc}"
     return True, completed.stdout.strip()
+
+
+def resolve_appid(appid: int | None) -> int | None:
+    """Спрашивает/проверяет appid из config.TRACKED_APPS."""
+    if appid is None:
+        raw = ask("appid (Enter = 570): ", "570")
+        if not raw.isdigit():
+            print("FAIL: appid должен быть числом.")
+            return None
+        appid = int(raw)
+    if appid not in config.TRACKED_APPS:
+        print(f"FAIL: appid {appid} нет в config.TRACKED_APPS.")
+        print("Доступные: " + ", ".join(str(a) for a in config.TRACKED_APPS))
+        return None
+    return appid
+
+
+def prepare_test_update(session: requests.Session, appid: int) -> tuple[dict, Path, str] | None:
+    """Готовит тестовое 'обновление' (old = current - 1) и файл для вложения.
+
+    Историю не трогает. Если baseline-файла нет — создаёт его из Steam API.
+    Возвращает (update, путь к JSON, commit_url) либо None.
+    """
+    name = config.TRACKED_APPS[appid]["name"]
+    tracker.ensure_storage()
+    path = tracker.version_file_path(appid, name)
+
+    payload = tracker.read_saved_payload(path) if path.exists() else None
+    version = tracker.extract_active_version(payload)
+    if version is None:
+        print("Baseline-файла нет (или он повреждён) — запрашиваю версию у Steam API...")
+        payload = tracker.fetch_steam_payload(session, appid, config.TRACKED_APPS[appid])
+        version = tracker.extract_active_version(payload)
+        if version is None:
+            print("FAIL: Steam API недоступен, а файла для вложения нет.")
+            return None
+        tracker.save_payload(path, payload)
+        print(f"Создан baseline-файл: {path.name}")
+
+    if isinstance(version, int):
+        old_version, new_version = version - 1, version
+    else:
+        old_version, new_version = "0", version
+
+    git_ok, git_out = git_run("rev-parse", "HEAD")
+    commit_hash = git_out if git_ok and git_out else "test"
+    base_repo = repo_url()
+    if base_repo:
+        commit_url = f"{base_repo.rstrip('/')}/commit/{commit_hash}"
+    else:
+        commit_url = "https://github.com"
+        print("WARNING: GITHUB_REPO_URL не задан — ссылка на diff будет заглушкой.")
+
+    update = {
+        "appid": appid,
+        "name": name,
+        "old_version": old_version,
+        "new_version": new_version,
+        "timestamp": tracker.msk_timestamp(),
+    }
+    return update, path, commit_url
 
 
 def check_steam(session: requests.Session) -> bool:
@@ -187,55 +329,14 @@ def check_discord_embed(session: requests.Session, appid: int | None = None) -> 
     url = require_webhook()
     if url is None:
         return False
-
+    appid = resolve_appid(appid)
     if appid is None:
-        raw = ask("appid (Enter = 570): ", "570")
-        if not raw.isdigit():
-            print("FAIL: appid должен быть числом.")
-            return False
-        appid = int(raw)
-    if appid not in config.TRACKED_APPS:
-        print(f"FAIL: appid {appid} нет в config.TRACKED_APPS.")
-        print("Доступные: " + ", ".join(str(a) for a in config.TRACKED_APPS))
         return False
+    prepared = prepare_test_update(session, appid)
+    if prepared is None:
+        return False
+    update, path, commit_url = prepared
 
-    name = config.TRACKED_APPS[appid]["name"]
-    tracker.ensure_storage()
-    path = tracker.version_file_path(appid, name)
-
-    payload = tracker.read_saved_payload(path) if path.exists() else None
-    version = tracker.extract_active_version(payload)
-    if version is None:
-        print("Baseline-файла нет (или он повреждён) — запрашиваю версию у Steam API...")
-        payload = tracker.fetch_steam_payload(session, appid, config.TRACKED_APPS[appid])
-        version = tracker.extract_active_version(payload)
-        if version is None:
-            print("FAIL: Steam API недоступен, а файла для вложения нет.")
-            return False
-        tracker.save_payload(path, payload)
-        print(f"Создан baseline-файл: {path.name}")
-
-    if isinstance(version, int):
-        old_version, new_version = version - 1, version
-    else:
-        old_version, new_version = "0", version
-
-    git_ok, git_out = git_run("rev-parse", "HEAD")
-    commit_hash = git_out if git_ok and git_out else "test"
-    base_repo = repo_url()
-    if base_repo:
-        commit_url = f"{base_repo.rstrip('/')}/commit/{commit_hash}"
-    else:
-        commit_url = "https://github.com"
-        print("WARNING: GITHUB_REPO_URL не задан — ссылка на diff будет заглушкой.")
-
-    update = {
-        "appid": appid,
-        "name": name,
-        "old_version": old_version,
-        "new_version": new_version,
-        "timestamp": tracker.msk_timestamp(),
-    }
     embed = tracker.build_embed(update, commit_url)
     embed["title"] = "[ТЕСТ] " + embed["title"]
     embed["description"] = (
@@ -256,9 +357,127 @@ def check_discord_embed(session: requests.Session, appid: int | None = None) -> 
     return ok
 
 
+def check_telegram_text(session: requests.Session) -> bool:
+    print(SEP)
+    print("ПРОВЕРКА 4: Telegram — текстовое сообщение")
+    print(SEP)
+    creds = require_telegram()
+    if creds is None:
+        return False
+    token, chat_id = creds
+    url = config.TELEGRAM_API_URL_TEMPLATE.format(token=token, method="sendMessage")
+    text = (
+        "Тест трекера Dota 2: Telegram работает. "
+        f"Время: {tracker.msk_timestamp()} (UTC+3)"
+    )
+
+    def send():
+        return session.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "link_preview_options": {"is_disabled": True},
+            },
+            timeout=config.TELEGRAM_TIMEOUT_SECONDS,
+        )
+
+    ok = tg_post_with_retry(send)
+    print("OK: сообщение отправлено, проверьте канал Telegram." if ok else "Сообщение не отправлено.")
+    return ok
+
+
+def check_telegram_document(session: requests.Session, appid: int | None = None) -> bool:
+    print(SEP)
+    print("ПРОВЕРКА 5: Telegram — документ + HTML-подпись")
+    print(SEP)
+    creds = require_telegram()
+    if creds is None:
+        return False
+    token, chat_id = creds
+    appid = resolve_appid(appid)
+    if appid is None:
+        return False
+    prepared = prepare_test_update(session, appid)
+    if prepared is None:
+        return False
+    update, path, commit_url = prepared
+
+    caption = (
+        "[ТЕСТ] Проверочное сообщение трекера — это НЕ реальное обновление.\n"
+        + tracker.build_telegram_caption(update, commit_url)
+    )
+    file_bytes = path.read_bytes()
+    url = config.TELEGRAM_API_URL_TEMPLATE.format(token=token, method="sendDocument")
+
+    def send():
+        return session.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={"document": (path.name, file_bytes, "application/json")},
+            timeout=config.TELEGRAM_TIMEOUT_SECONDS,
+        )
+
+    ok = tg_post_with_retry(send)
+    print("OK: тестовый документ с подписью отправлен." if ok else "Документ не отправлен.")
+    return ok
+
+
+def check_telegram_chat_id(session: requests.Session) -> bool:
+    print(SEP)
+    print("ПРОВЕРКА 6: Telegram — определить chat_id (getUpdates)")
+    print(SEP)
+    token = telegram_token()
+    if not token:
+        print("FAIL: TELEGRAM_BOT_TOKEN не задан (.env). Создайте бота у @BotFather (/newbot).")
+        return False
+    url = config.TELEGRAM_API_URL_TEMPLATE.format(token=token, method="getUpdates")
+    try:
+        response = session.get(url, timeout=config.TELEGRAM_TIMEOUT_SECONDS)
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        print(f"FAIL: сетевая ошибка {type(exc).__name__}.")
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        description = body.get("description") if isinstance(body, dict) else response.text[:200]
+        print(f"FAIL: getUpdates HTTP {response.status_code}: {description}")
+        if response.status_code == 401:
+            print("      Неверный TELEGRAM_BOT_TOKEN.")
+        return False
+
+    chats: dict = {}
+    for upd in body.get("result", []):
+        if not isinstance(upd, dict):
+            continue
+        for key in ("message", "channel_post", "my_chat_member", "chat_member"):
+            obj = upd.get(key)
+            if isinstance(obj, dict):
+                chat = obj.get("chat")
+                if isinstance(chat, dict) and "id" in chat:
+                    chats[chat["id"]] = chat
+
+    if not chats:
+        print("Чаты не найдены. Сделайте бота АДМИНОМ канала, опубликуйте любой пост")
+        print("и повторите пункт 6 (или напишите боту в личку /start).")
+        return False
+
+    print("Найденные чаты:")
+    for chat in chats.values():
+        title = chat.get("title") or chat.get("username") or chat.get("first_name") or "?"
+        username = chat.get("username")
+        suffix = f" (@{username})" if username else ""
+        print(f"  id={chat['id']}  type={chat.get('type')}  {title}{suffix}")
+    print("Скопируйте id нужного канала в TELEGRAM_CHAT_ID.")
+    print("Для публичного канала можно использовать @username вместо числового id.")
+    return True
+
+
 def check_git() -> bool:
     print(SEP)
-    print("ПРОВЕРКА 4: Git (ничего не отправляется: push --dry-run)")
+    print("ПРОВЕРКА 7: Git (ничего не отправляется: push --dry-run)")
     print(SEP)
     ok, out = git_run("rev-parse", "--is-inside-work-tree")
     if not (ok and out == "true"):
@@ -306,18 +525,37 @@ def check_git() -> bool:
 
 
 def run_all(session: requests.Session) -> bool:
-    results = {
-        "Steam API": check_steam(session),
-        "Discord текст": check_discord_text(session),
-        "Discord embed + файл": check_discord_embed(session, appid=570),
-        "Git": check_git(),
-    }
+    results: list[tuple[str, bool | None]] = []
+    results.append(("Steam API", check_steam(session)))
+
+    if webhook_url():
+        results.append(("Discord текст", check_discord_text(session)))
+        results.append(("Discord embed + файл", check_discord_embed(session, appid=570)))
+    else:
+        print("\nSKIP: Discord не настроен (DISCORD_WEBHOOK_URL не задан).")
+        results.append(("Discord", None))
+
+    if telegram_token() and telegram_chat_id():
+        results.append(("Telegram текст", check_telegram_text(session)))
+        results.append(("Telegram документ", check_telegram_document(session, appid=570)))
+    else:
+        print("\nSKIP: Telegram не настроен (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
+        results.append(("Telegram", None))
+
+    results.append(("Git", check_git()))
+
     print("\n" + SEP)
     print("СВОДКА")
     print(SEP)
-    for label, ok in results.items():
-        print(f"  {'OK  ' if ok else 'FAIL'} — {label}")
-    return all(results.values())
+    for label, ok in results:
+        mark = "SKIP" if ok is None else ("OK  " if ok else "FAIL")
+        print(f"  {mark} — {label}")
+
+    notifier_configured = bool(webhook_url()) or bool(telegram_token() and telegram_chat_id())
+    if not notifier_configured:
+        print("FAIL: не настроен ни один канал уведомлений.")
+    executed = [ok for _, ok in results if ok is not None]
+    return all(executed) and notifier_configured
 
 
 def main() -> int:
@@ -327,6 +565,8 @@ def main() -> int:
     print(SEP)
     print(f"DISCORD_WEBHOOK_URL: {'задан' if webhook_url() else 'НЕ задан'}")
     print(f"GITHUB_REPO_URL:     {repo_url() or 'НЕ задан'}")
+    tg_ready = bool(telegram_token() and telegram_chat_id())
+    print(f"TELEGRAM:            {'задан' if tg_ready else 'НЕ задан'}")
     print("DRY_RUN на этот скрипт не влияет: тесты отправляются реально.")
     with requests.Session() as session:
         session.headers.update({"User-Agent": config.USER_AGENT})
@@ -334,11 +574,14 @@ def main() -> int:
             print("\n" + SEP)
             print("1 — Steam API: текущие версии всех целей")
             print("2 — Discord: тестовое текстовое сообщение")
-            print("3 — Discord: тестовый embed + JSON-файл (формат уведомления)")
-            print("4 — Git: репозиторий, identity, remote, право на push")
-            print("5 — все проверки сразу")
+            print("3 — Discord: тестовый embed + JSON-файл")
+            print("4 — Telegram: тестовое текстовое сообщение")
+            print("5 — Telegram: тестовый документ + подпись")
+            print("6 — Telegram: определить chat_id (getUpdates)")
+            print("7 — Git: репозиторий, identity, remote, право на push")
+            print("8 — все проверки сразу")
             print("0 — выход")
-            choice = ask("Пункт [0-5]: ", "0")
+            choice = ask("Пункт [0-8]: ", "0")
             if choice == "0":
                 return 0
             elif choice == "1":
@@ -348,8 +591,14 @@ def main() -> int:
             elif choice == "3":
                 check_discord_embed(session)
             elif choice == "4":
-                check_git()
+                check_telegram_text(session)
             elif choice == "5":
+                check_telegram_document(session)
+            elif choice == "6":
+                check_telegram_chat_id(session)
+            elif choice == "7":
+                check_git()
+            elif choice == "8":
                 return 0 if run_all(session) else 1
             else:
                 print("Неизвестный пункт.")
