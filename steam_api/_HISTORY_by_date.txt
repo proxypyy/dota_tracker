@@ -59,3 +59,7 @@
 247060 - Dota 2 Experimental Server | [v] 7505 => 7510 | 2026-11-24 04:45:06 (UTC+3)
 247040 - Dota 2 Experimental | [v] 7510 => 7515 | 2026-11-25 00:29:30 (UTC+3)
 247060 - Dota 2 Experimental Server | [v] 7510 => 7515 | 2026-11-25 00:29:31 (UTC+3)
+570 - Dota 2 | [v] 6993 => 6996 | 2026-11-25 07:28:39 (UTC+3)
+373310 - Dota 2 Dedicated Server | [v] 6993 => 6996 | 2026-11-25 07:28:41 (UTC+3)
+247040 - Dota 2 Experimental | [v] 7515 => 7519 | 2026-11-25 07:28:43 (UTC+3)
+247060 - Dota 2 Experimental Server | [v] 7515 => 7519 | 2026-11-25 07:28:44 (UTC+3)
